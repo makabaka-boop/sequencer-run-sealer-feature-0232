@@ -18,14 +18,15 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 )
 
-const (
-	stateFile = "/verify-state/state.json"
-)
+// stateFile locates the fixture state handed across API restarts; the
+// VERIFY_STATE_FILE override is only used outside the compose stack.
+var stateFile = "/verify-state/state.json"
 
 type config struct {
 	api1 string
@@ -33,6 +34,7 @@ type config struct {
 }
 
 func main() {
+	stateFile = envOr("VERIFY_STATE_FILE", stateFile)
 	cfg := config{
 		api1: envOr("API1_URL", "http://api1:8080"),
 		api2: envOr("API2_URL", "http://api2:8080"),
@@ -52,6 +54,8 @@ func main() {
 	v.checkLifecycleAcrossInstances(ctx)
 	v.checkValidation(ctx)
 	v.checkCrossInstanceSealRace(ctx)
+	v.checkSealGroupProtocol(ctx)
+	v.checkCrossInstanceSealGroupRace(ctx)
 
 	switch phase := os.Getenv("VERIFY_PHASE"); phase {
 	case "seed":
@@ -340,12 +344,299 @@ func (v *verifier) checkCrossInstanceSealRace(ctx context.Context) {
 	}
 }
 
+// checkSealGroupProtocol exercises the indivisible group seal while
+// alternating both instances: atomic success in request order, idempotent
+// retries (reverse order) with stable timing and preserved sealedAt,
+// 409 INCOMPLETE changing nothing, and the 400/404 validation matrix.
+func (v *verifier) checkSealGroupProtocol(ctx context.Context) {
+
+	// Two complete members, filled via the opposite instances.
+	a := v.createBatch(ctx, v.cfg.api1, 2)
+	b := v.createBatch(ctx, v.cfg.api2, 3)
+	for seq := 1; seq <= 2; seq++ {
+		v.mustChunk(ctx, v.cfg.api2, a, seq, "a")
+	}
+	for seq := 1; seq <= 3; seq++ {
+		v.mustChunk(ctx, v.cfg.api1, b, seq, "b")
+	}
+
+	code, body, _ := v.request(ctx, http.MethodPost, v.cfg.api1+"/api/v1/batches/seal-group",
+		map[string]any{"batchIds": []string{a, b}})
+	if code != 200 {
+		v.failf("group seal: status=%d body=%v", code, body)
+		return
+	}
+	list, _ := body["batches"].([]any)
+	if len(list) != 2 ||
+		list[0].(map[string]any)["batchId"] != a ||
+		list[1].(map[string]any)["batchId"] != b {
+		v.failf("group seal order wrong: %v", body)
+	}
+	stampA, _ := list[0].(map[string]any)["sealedAt"].(string)
+	stampB, _ := list[1].(map[string]any)["sealedAt"].(string)
+	if stampA == "" || stampB == "" {
+		v.failf("group seal missing sealedAt: %v", body)
+	}
+
+	// Visible identically on the other instance.
+	for _, id := range []string{a, b} {
+		code, snap, _ := v.request(ctx, http.MethodGet, v.cfg.api2+"/api/v1/batches/"+id, nil)
+		if code != 200 || snap["status"] != "SEALED" {
+			v.failf("group member %s not sealed on other instance: %d %v", id, code, snap)
+		}
+	}
+
+	// Reverse-order idempotent retries on the other instance: same stamps,
+	// timing must stay stable (no lock-order stalls, no deadlock waits).
+	const retries = 10
+	var maxLatency time.Duration
+	for i := 0; i < retries; i++ {
+		start := time.Now()
+		code, retry, _ := v.request(ctx, http.MethodPost,
+			v.cfg.api2+"/api/v1/batches/seal-group",
+			map[string]any{"batchIds": []string{b, a}})
+		d := time.Since(start)
+		if d > maxLatency {
+			maxLatency = d
+		}
+		if code != 200 {
+			v.failf("group retry %d: status=%d body=%v", i, code, retry)
+			break
+		}
+		rl := retry["batches"].([]any)
+		if rl[0].(map[string]any)["sealedAt"] != stampB ||
+			rl[1].(map[string]any)["sealedAt"] != stampA {
+			v.failf("group retry overwrote sealedAt: %v", retry)
+		}
+	}
+	if maxLatency > 2*time.Second {
+		v.failf("group retries too slow (max %s): lock-order stall?", maxLatency)
+	}
+	v.log("group seal idempotent retries stable (max %s over %d)", maxLatency, retries)
+
+	// Mix an already SEALED member with a fresh complete one: success, and
+	// the existing sealedAt is preserved.
+	d := v.createBatch(ctx, v.cfg.api2, 1)
+	v.mustChunk(ctx, v.cfg.api1, d, 1, "d")
+	code, body, _ = v.request(ctx, http.MethodPost, v.cfg.api1+"/api/v1/batches/seal-group",
+		map[string]any{"batchIds": []string{a, d}})
+	if code != 200 {
+		v.failf("mixed group seal: status=%d body=%v", code, body)
+	} else {
+		ml := body["batches"].([]any)
+		if ml[0].(map[string]any)["sealedAt"] != stampA {
+			v.failf("mixed group overwrote existing sealedAt: %v", ml[0])
+		}
+		if ml[1].(map[string]any)["sealedAt"] == nil ||
+			ml[1].(map[string]any)["sealedAt"] == "" {
+			v.failf("mixed group did not seal new member: %v", ml[1])
+		}
+	}
+
+	// A complete, B incomplete: 409 INCOMPLETE lists only B in request order
+	// with expected/received/ascending gaps; nothing changes.
+	g := v.createBatch(ctx, v.cfg.api1, 2) // complete
+	for seq := 1; seq <= 2; seq++ {
+		v.mustChunk(ctx, v.cfg.api2, g, seq, "g")
+	}
+	h := v.createBatch(ctx, v.cfg.api2, 3) // only chunk 1 present
+	v.mustChunk(ctx, v.cfg.api1, h, 1, "h")
+	code, body, raw := v.request(ctx, http.MethodPost,
+		v.cfg.api2+"/api/v1/batches/seal-group",
+		map[string]any{"batchIds": []string{g, h}})
+	if code != 409 || body["error"] != "INCOMPLETE" {
+		v.failf("incomplete group: status=%d body=%v", code, body)
+	} else {
+		il := body["batches"].([]any)
+		if len(il) != 1 || il[0].(map[string]any)["batchId"] != h {
+			v.failf("incomplete list wrong: %v", body)
+		} else {
+			inc := il[0].(map[string]any)
+			gaps := inc["gaps"].([]any)
+			if int(inc["expected"].(float64)) != 3 ||
+				int(inc["received"].(float64)) != 1 ||
+				len(gaps) != 2 ||
+				int(gaps[0].(float64)) != 2 || int(gaps[1].(float64)) != 3 {
+				v.failf("incomplete entry wrong: %v", raw)
+			}
+		}
+	}
+	// G (complete) must still be OPEN; H unchanged.
+	if !v.expectStatus(ctx, v.cfg.api1, g, "OPEN") || !v.expectStatus(ctx, v.cfg.api2, h, "OPEN") {
+		v.failf("failed group seal changed members")
+	}
+
+	// Validation matrix: all rejected requests are 400 INVALID_BATCH_GROUP
+	// with zero side effects; unknown IDs are 404 BATCH_NOT_FOUND.
+	unknown := "ffffffffffffffffffffffffffffffff"
+	badCases := []struct {
+		name string
+		raw  string
+	}{
+		{"malformed json", `{"batchIds": [`},
+		{"missing batchIds", `{}`},
+		{"extra field", `{"batchIds":["` + a + `","` + d + `"],"x":1}`},
+		{"empty array", `{"batchIds":[]}`},
+		{"single member", `{"batchIds":["` + a + `"]}`},
+		{"duplicate ids", `{"batchIds":["` + a + `","` + a + `"]}`},
+		{"uppercase id", `{"batchIds":["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","` + d + `"]}`},
+		{"short id", `{"batchIds":["abc","` + d + `"]}`},
+		{"non-string id", `{"batchIds":[1,"` + d + `"]}`},
+		{"batchIds string", `{"batchIds":"` + a + `"}`},
+	}
+	for _, tc := range badCases {
+		code, parsed, _ := v.request(ctx, http.MethodPost,
+			v.cfg.api1+"/api/v1/batches/seal-group", json.RawMessage(tc.raw))
+		if code != 400 || parsed["error"] != "INVALID_BATCH_GROUP" {
+			v.failf("bad case %q: status=%d body=%v, want 400 INVALID_BATCH_GROUP",
+				tc.name, code, parsed)
+		}
+	}
+	// 101 members.
+	big := `{"batchIds":[`
+	for i := 0; i < 101; i++ {
+		if i > 0 {
+			big += ","
+		}
+		big += `"` + unknown + `"`
+	}
+	big += `]}`
+	if code, parsed, _ := v.request(ctx, http.MethodPost,
+		v.cfg.api1+"/api/v1/batches/seal-group", json.RawMessage(big)); code != 400 ||
+		parsed["error"] != "INVALID_BATCH_GROUP" {
+		v.failf("101 members: status=%d body=%v", code, parsed)
+	}
+	// Unknown, unknown among known, and duplicate-free but missing: 404.
+	for _, ids := range [][]string{
+		{unknown, g},
+		{g, unknown, h},
+	} {
+		code, parsed, _ := v.request(ctx, http.MethodPost,
+			v.cfg.api2+"/api/v1/batches/seal-group", map[string]any{"batchIds": ids})
+		if code != 404 || parsed["error"] != "BATCH_NOT_FOUND" {
+			v.failf("unknown group %v: status=%d body=%v", ids, code, parsed)
+		}
+	}
+	// No rejected call above may have sealed G or H.
+	if !v.expectStatus(ctx, v.cfg.api2, g, "OPEN") || !v.expectStatus(ctx, v.cfg.api1, h, "OPEN") {
+		v.failf("rejected group seal had side effects")
+	}
+}
+
+// checkCrossInstanceSealGroupRace interleaves group seals [A,B] (instance 1)
+// and [B,A] (instance 2) with B's final chunk landing on instance 1. A is
+// complete from the start. Canonical ascending-ID locking across chunk
+// submit, single seal and group seal keeps this deadlock free, and the
+// settled state can only be "both SEALED" or "no new seal at all".
+func (v *verifier) checkCrossInstanceSealGroupRace(ctx context.Context) {
+	const rounds = 25
+	for i := 0; i < rounds; i++ {
+		a := v.createBatch(ctx, v.cfg.api1, 1)
+		b := v.createBatch(ctx, v.cfg.api2, 1)
+		// A already complete, B waiting for its only chunk.
+		code, _, _ := v.request(ctx, http.MethodPost,
+			v.cfg.api2+"/api/v1/batches/"+a+"/chunks",
+			map[string]any{"seq": 1, "payload": "a"})
+		if code != 201 {
+			v.failf("race round %d: seed A chunk %d", i, code)
+			continue
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(3)
+		var codeAB, codeBA, codeChunk int
+		go func() {
+			defer wg.Done()
+			codeAB, _, _ = v.request(ctx, http.MethodPost,
+				v.cfg.api1+"/api/v1/batches/seal-group",
+				map[string]any{"batchIds": []string{a, b}})
+		}()
+		go func() {
+			defer wg.Done()
+			codeBA, _, _ = v.request(ctx, http.MethodPost,
+				v.cfg.api2+"/api/v1/batches/seal-group",
+				map[string]any{"batchIds": []string{b, a}})
+		}()
+		go func() {
+			defer wg.Done()
+			codeChunk, _, _ = v.request(ctx, http.MethodPost,
+				v.cfg.api1+"/api/v1/batches/"+b+"/chunks",
+				map[string]any{"seq": 1, "payload": "last"})
+		}()
+
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			v.failf("race round %d: three-way interlock timed out (deadlock)", i)
+			return
+		}
+
+		if codeChunk != 201 {
+			v.failf("race round %d: final chunk status %d", i, codeChunk)
+		}
+		if (codeAB != 200 && codeAB != 409) || (codeBA != 200 && codeBA != 409) {
+			v.failf("race round %d: unexpected group codes AB=%d BA=%d", i, codeAB, codeBA)
+		}
+
+		_, snapA, _ := v.request(ctx, http.MethodGet, v.cfg.api1+"/api/v1/batches/"+a, nil)
+		_, snapB, _ := v.request(ctx, http.MethodGet, v.cfg.api2+"/api/v1/batches/"+b, nil)
+		stA, _ := snapA["status"].(string)
+		stB, _ := snapB["status"].(string)
+		switch {
+		case stA == "SEALED" && stB == "SEALED":
+			if int(snapA["received"].(float64)) != 1 ||
+				int(snapB["received"].(float64)) != 1 ||
+				len(snapB["gaps"].([]any)) != 0 {
+				v.failf("race round %d: SEALED group with gaps: %v %v", i, snapA, snapB)
+			}
+		case stA == "OPEN" && stB == "OPEN":
+			if codeAB != 409 || codeBA != 409 {
+				v.failf("race round %d: both OPEN but codes AB=%d BA=%d", i, codeAB, codeBA)
+			}
+		default:
+			v.failf("race round %d: partial sealing forbidden: A=%s B=%s", i, stA, stB)
+		}
+
+		// Convergence: once B is complete, another group seal succeeds.
+		code, settled, _ := v.request(ctx, http.MethodPost,
+			v.cfg.api2+"/api/v1/batches/seal-group",
+			map[string]any{"batchIds": []string{a, b}})
+		if code != 200 {
+			v.failf("race round %d: settling group seal %d %v", i, code, settled)
+		}
+	}
+}
+
+// mustChunk submits one chunk and fails the verifier unless it is a first
+// write (201).
+func (v *verifier) mustChunk(ctx context.Context, base, id string, seq int, payload string) {
+	code, body, _ := v.request(ctx, http.MethodPost,
+		base+"/api/v1/batches/"+id+"/chunks",
+		map[string]any{"seq": seq, "payload": payload})
+	if code != 201 {
+		v.failf("chunk %s seq=%d: status=%d body=%v", id, seq, code, body)
+	}
+}
+
+func (v *verifier) expectStatus(ctx context.Context, base, id, want string) bool {
+	code, snap, _ := v.request(ctx, http.MethodGet, base+"/api/v1/batches/"+id, nil)
+	if code != 200 || snap["status"] != want {
+		v.failf("batch %s: code=%d status=%v want %s", id, code, snap["status"], want)
+		return false
+	}
+	return true
+}
+
 // persistedState is handed across the API restart via a shared volume.
 type persistedState struct {
-	OpenID       string `json:"openId"`
-	SealedID     string `json:"sealedId"`
-	SealedAt     string `json:"sealedAt"`
-	OpenReceived int    `json:"openReceived"`
+	OpenID        string   `json:"openId"`
+	SealedID      string   `json:"sealedId"`
+	SealedAt      string   `json:"sealedAt"`
+	OpenReceived  int      `json:"openReceived"`
+	GroupIDs      []string `json:"groupIds"`
+	GroupSealedAt []string `json:"groupSealedAt"`
 }
 
 func (v *verifier) phaseSeed(ctx context.Context) {
@@ -367,6 +658,26 @@ func (v *verifier) phaseSeed(ctx context.Context) {
 	_, sealed, _ := v.request(ctx, http.MethodPost,
 		v.cfg.api1+"/api/v1/batches/"+st.SealedID+"/seal", nil)
 	st.SealedAt, _ = sealed["sealedAt"].(string)
+
+	// Group seal fixture: two complete batches sealed as one indivisible
+	// group (reverse request order on purpose). Their SEALED verdicts and
+	// sealedAt stamps must survive the restart unchanged.
+	g1 := v.createBatch(ctx, v.cfg.api1, 1)
+	v.mustChunk(ctx, v.cfg.api2, g1, 1, "g1")
+	g2 := v.createBatch(ctx, v.cfg.api2, 1)
+	v.mustChunk(ctx, v.cfg.api1, g2, 1, "g2")
+	_, groupSealed, _ := v.request(ctx, http.MethodPost,
+		v.cfg.api2+"/api/v1/batches/seal-group",
+		map[string]any{"batchIds": []string{g2, g1}})
+	if list, ok := groupSealed["batches"].([]any); ok && len(list) == 2 {
+		for _, item := range list {
+			m := item.(map[string]any)
+			st.GroupIDs = append(st.GroupIDs, m["batchId"].(string))
+			st.GroupSealedAt = append(st.GroupSealedAt, m["sealedAt"].(string))
+		}
+	} else {
+		v.failf("seed group seal wrong: %v", groupSealed)
+	}
 
 	if err := writeState(st); err != nil {
 		v.failf("write state: %v", err)
@@ -418,12 +729,44 @@ func (v *verifier) phaseRestart(ctx context.Context) {
 	if code != 200 || resealed["sealedAt"] != st.SealedAt {
 		v.failf("after restart reseal wrong: code=%d body=%v", code, resealed)
 	}
+
+	// Group seal verdicts and sealedAt stamps survive unchanged, and a
+	// post-restart group retry is idempotent in the same request order.
+	if len(st.GroupIDs) != 2 || len(st.GroupSealedAt) != 2 {
+		v.failf("after restart missing group fixture: %+v", st)
+	} else {
+		for i, id := range st.GroupIDs {
+			code, gs, _ := v.request(ctx, http.MethodGet,
+				v.cfg.api1+"/api/v1/batches/"+id, nil)
+			if code != 200 || gs["status"] != "SEALED" ||
+				int(gs["received"].(float64)) != int(gs["expected"].(float64)) ||
+				gs["sealedAt"] != st.GroupSealedAt[i] {
+				v.failf("after restart group member %s wrong: code=%d body=%v want sealedAt=%s",
+					id, code, gs, st.GroupSealedAt[i])
+			}
+		}
+		code, reg, _ := v.request(ctx, http.MethodPost,
+			v.cfg.api2+"/api/v1/batches/seal-group",
+			map[string]any{"batchIds": st.GroupIDs})
+		if code != 200 {
+			v.failf("after restart group retry: code=%d body=%v", code, reg)
+		} else {
+			for i, item := range reg["batches"].([]any) {
+				m := item.(map[string]any)
+				if m["batchId"] != st.GroupIDs[i] || m["sealedAt"] != st.GroupSealedAt[i] {
+					v.failf("after restart group retry changed verdict: %v", reg)
+				}
+			}
+		}
+	}
 	v.log("restart verdicts confirmed identical on both instances")
 }
 
 func writeState(s persistedState) error {
-	if err := os.MkdirAll("/verify-state", 0o755); err != nil {
-		return err
+	if dir := filepath.Dir(stateFile); dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
 	}
 	b, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {

@@ -143,6 +143,54 @@ docker compose down -v
 }
 ```
 
+### 5. 批次组封存（整组不可分割）
+
+`POST /api/v1/batches/seal-group`
+
+测序交接需要把多个批次作为**一个不可分割单元**封存：整组要么共同进入
+`SEALED`，要么一个都不动。请求体只含 `batchIds` 数组：
+
+```json
+{ "batchIds": ["182a8a5485765bafb286a7a8e4ce7c69", "0f1e2d3c4b5a69788796a5b4c3d2e1f0"] }
+```
+
+- 数量必须为 **2–100**（含端点）；ID 沿用 32 位小写十六进制格式，且**不可重复**；
+  请求体不允许出现其它字段。
+- 存储层在**一个 PostgreSQL 事务**内按 ID **升序逐行 `SELECT … FOR UPDATE`**
+  锁定全组（与请求顺序无关），再基于**锁后快照**计算每个成员的缺口：
+  - 所有 `OPEN` 成员齐备：同一条 `UPDATE` 把它们**共同**转为 `SEALED`；
+  - 已有 `SEALED` 成员视为**幂等成功**，**保留原 `sealedAt`**；
+  - 任一 `OPEN` 成员缺片：事务不写任何数据，返回 **409 `INCOMPLETE`**，
+    其余成员保持调用前状态——已齐备的 `OPEN` 成员也不会被顺带封存。
+- `200` 的 `batches` 与 `409` 中 `batches` 都按**请求顺序**排列；后者只列出
+  所有不完整成员，每项含 `expected`、`received` 与升序 `gaps`。
+
+`200`：
+
+```json
+{
+  "batches": [
+    { "batchId": "182a…", "status": "SEALED", "expected": 3, "received": 3, "gaps": [], "sealedAt": "…" },
+    { "batchId": "0f1e…", "status": "SEALED", "expected": 1, "received": 1, "gaps": [], "sealedAt": "…" }
+  ]
+}
+```
+
+`409 INCOMPLETE`（A 齐备、B 缺片；响应只列 B，A 保持 OPEN）：
+
+```json
+{
+  "error": "INCOMPLETE",
+  "message": "one or more batches are missing chunks",
+  "batches": [
+    { "batchId": "0f1e…", "status": "OPEN", "expected": 3, "received": 1, "gaps": [2, 3] }
+  ]
+}
+```
+
+整组重试（即使请求反序）是幂等的：已封存成员返回既有 `sealedAt`，整组响应时间
+保持稳定（无锁序等待）。
+
 ---
 
 ## 固定状态码表
@@ -157,6 +205,10 @@ docker compose down -v
 | `payload` 非字符串 | 400 | `INVALID_PAYLOAD` |
 | `payload` 超过 65536 UTF-8 字节 | 413 | `PAYLOAD_TOO_LARGE` |
 | 批次不存在 / ID 非法 | 404 | `BATCH_NOT_FOUND` |
+| 组封存数量非 2–100 / ID 格式非法 / ID 重复 / 含额外字段 | 400 | `INVALID_BATCH_GROUP` |
+| 组封存中存在未知批次 | 404 | `BATCH_NOT_FOUND`（成员均不变） |
+| 组封存中任一成员缺片 | 409 | `INCOMPLETE`（`batches` 按请求顺序列出不完整成员，整组不变） |
+| 组封存成功 / 整组幂等重试 | 200 | — |
 | 同序号不同内容 | 409 | `CHUNK_CONFLICT` |
 | 封存后变更内容 | 409 | `BATCH_SEALED` |
 | 缺片封存 | 409 | `INCOMPLETE`（携带 `gaps`，保持 OPEN） |
@@ -185,6 +237,17 @@ curl -s -X POST localhost:8080/api/v1/batches/$B/seal                           
 
 两个实例返回一致：`api1` 写入，可立即从 `api2`（仅内部网络可达）读到同一终态。
 
+组封存示例：
+
+```bash
+curl -s -X POST localhost:8080/api/v1/batches/seal-group \
+  -d '{"batchIds":["'$A'","'$B'"]}'                       # 409 INCOMPLETE，整组不变
+curl -s -X POST localhost:8080/api/v1/batches/seal-group \
+  -d '{"batchIds":["'$B'","'$A'"]}'                       # 200，batches 按请求顺序
+curl -s -X POST localhost:8080/api/v1/batches/seal-group \
+  -d '{"batchIds":["'$A'","'$B'"]}'                       # 200 幂等，sealedAt 不变
+```
+
 ---
 
 ## 并发正确性：为什么不会“已封存却缺片”
@@ -204,6 +267,21 @@ curl -s -X POST localhost:8080/api/v1/batches/$B/seal                           
 一个事务先插入并提交，另一个读到已存字节并返回 `CHUNK_CONFLICT`，分片表始终只有一行。
 
 状态接口在一条 SQL 快照中同时计算 `received` 与 `gaps`，二者永远自洽。
+
+### 组封存：为什么整组原子且正反序并发不死锁
+
+`seal-group` 在一个事务内完成三步：先把请求 ID **排序**，再按升序**逐行**
+`SELECT … FOR UPDATE`（不依赖集合查询的计划级锁序），然后才从锁后快照计算缺口。
+分片提交、单批次封存与组封存因此共享同一套行锁裁决：
+
+- 组 `[A,B]` 与组 `[B,A]` 都按 A→B 的规范顺序取锁，不可能构成锁等待环；
+- 缺片判定一律发生在拿锁之后，所以组封存与“最后一片提交”并发时，要么组先拿锁
+  看到缺口（`409 INCOMPLETE`，整组回滚），要么分片先提交、组看到完整集合后整组封存；
+  **不会出现整组中只封存了一部分**；
+- 封存更新只匹配 `status='OPEN'` 的成员，已 `SEALED` 成员的 `sealed_at`
+  永不被覆盖；
+- 未知 ID 与缺片都在提交前判定并回滚，失败路径不写入任何状态，故
+  未知/重复/非法 ID 调用对成员零副作用（非法请求在进入事务前即被 400 拒绝）。
 
 ## 重启一致性
 
@@ -234,9 +312,16 @@ go test -race -count=1 ./...
 
 - `internal/store`：乱序、重传幂等、UTF-8 字节判同、冲突、封存不完整保持 OPEN、
   封存/最后一片跨连接池竞争（30 轮）、双写冲突竞争（30 轮）、关闭全部连接后重开的重启一致性；
+  组封存的整组成功/反序请求/已封存幂等保留 `sealedAt`/A 齐备 B 缺片整体不变/
+  多缺片按请求顺序列出/未知 ID 无副作用、`[A,B]`+`[B,A]`+B 最后一片三方竞争
+  （40 轮，含 60s 超时断言）、组封存与单批次封存竞争、30 轮正反序高争用组封存；
 - `internal/api`：两个独立连接池支撑的两个 HTTP 实例上交替写入/封存、全状态码矩阵、
-  跨实例封存竞争（20 轮）、关闭并重建两个实例后的终态一致性；
-- `cmd/verify`：Compose 内一次性验收程序，协议矩阵 + 25 轮跨实例竞争 + 重启两阶段。
+  跨实例封存竞争（20 轮）、关闭并重建两个实例后的终态一致性；组封存跨实例成功、
+  反序幂等重试延迟稳定断言、混合已封存成员保留 `sealedAt`、缺片 409 整体不变、
+  400/404 校验矩阵（含 2/100/101 边界、重复、格式、额外字段）且全程无副作用、
+  25 轮三方交错超时断言（只会全组成功或无新封存）、组封存与单批次封存交错；
+- `cmd/verify`：Compose 内一次性验收程序，协议矩阵 + 25 轮跨实例竞争 +
+  组封存协议/校验/稳定重试 + 25 轮三方交错 + 重启两阶段（含组封存夹具）。
 
 环境变量：
 

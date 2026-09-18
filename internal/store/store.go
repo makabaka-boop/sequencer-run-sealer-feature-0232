@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -277,6 +278,117 @@ func (s *Store) SealBatch(ctx context.Context, batchID string) (*Snapshot, error
 	snap.Status = StatusSealed
 	snap.SealedAt = &sealedAt
 	return snap, nil
+}
+
+// SealGroup seals a group of batches as one indivisible unit.
+//
+// One transaction locks every member row in ascending ID order, so group
+// sealing shares the same row-lock arbitration as SealBatch and
+// SubmitChunk: the [A,B] and [B,A] request orders acquire locks in one
+// canonical order and therefore cannot deadlock each other, and every
+// verdict is taken from the post-lock snapshot rather than racing a chunk
+// commit.
+//
+// Locks are taken one row at a time in application-sorted order (rather
+// than relying on a set-returning SELECT ... ORDER BY ... FOR UPDATE, whose
+// lock order follows the chosen query plan), which is the deterministic
+// ordered-locking protocol PostgreSQL itself recommends for avoiding
+// deadlocks.
+//
+//   - all members complete (OPEN with no gaps, or already SEALED): every
+//     OPEN member becomes SEALED in the same transaction; SEALED members
+//     are left untouched, preserving their existing sealed_at.
+//   - any member is missing chunks: nothing is written; ErrIncomplete is
+//     returned with snapshots of every incomplete member.
+//   - any ID does not exist: ErrNotFound, again with no writes.
+//
+// The returned snapshots follow the request order, not lock order.
+func (s *Store) SealGroup(ctx context.Context, batchIDs []string) ([]*Snapshot, []*Snapshot, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	// Canonical ascending lock order, independent of request order. Every
+	// transaction (group seal, single seal, chunk submit) locks batch rows
+	// one at a time, so two groups with reversed request orders serialize
+	// without a deadlock cycle.
+	lockOrder := make([]string, len(batchIDs))
+	copy(lockOrder, batchIDs)
+	sort.Strings(lockOrder)
+	for _, id := range lockOrder {
+		var existing string
+		err := tx.QueryRow(ctx,
+			`SELECT id FROM batches WHERE id = $1 FOR UPDATE`, id,
+		).Scan(&existing)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil, ErrNotFound
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	// Gaps are computed only after every lock is held, so the counts see a
+	// consistent post-lock snapshot of every member.
+	snaps := make([]*Snapshot, 0, len(batchIDs))
+	var incomplete []*Snapshot
+	for _, id := range batchIDs {
+		snap, err := snapshotQuery(ctx, tx, id, false)
+		if err != nil {
+			return nil, nil, err
+		}
+		snaps = append(snaps, snap)
+		if snap.Status == StatusOpen && len(snap.Gaps) > 0 {
+			incomplete = append(incomplete, snap)
+		}
+	}
+	if len(incomplete) > 0 {
+		// No UPDATE has been issued; rollback leaves every member exactly
+		// as it was before the call.
+		return nil, incomplete, ErrIncomplete
+	}
+
+	// One statement transitions every OPEN member together; SEALED rows
+	// are not matched, so their sealed_at survives. now() is constant
+	// within the transaction, stamping the newly sealed members equally.
+	updRows, err := tx.Query(ctx,
+		`UPDATE batches SET status = $1, sealed_at = now()
+		 WHERE id = ANY($2::char(32)[]) AND status = $3
+		 RETURNING id, sealed_at`,
+		StatusSealed, lockOrder, StatusOpen)
+	if err != nil {
+		return nil, nil, err
+	}
+	sealedAtByID := make(map[string]time.Time, len(batchIDs))
+	for updRows.Next() {
+		var id string
+		var sealedAt time.Time
+		if err := updRows.Scan(&id, &sealedAt); err != nil {
+			updRows.Close()
+			return nil, nil, err
+		}
+		sealedAtByID[id] = sealedAt
+	}
+	if err := updRows.Err(); err != nil {
+		updRows.Close()
+		return nil, nil, err
+	}
+	updRows.Close()
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, err
+	}
+
+	// Reflect the post-commit status in the returned snapshots; rows that
+	// were already SEALED keep their original sealed_at pointer.
+	for _, snap := range snaps {
+		if sealedAt, ok := sealedAtByID[snap.ID]; ok {
+			snap.Status = StatusSealed
+			snap.SealedAt = &sealedAt
+		}
+	}
+	return snaps, nil, nil
 }
 
 // querier is satisfied by both a pool and a transaction.

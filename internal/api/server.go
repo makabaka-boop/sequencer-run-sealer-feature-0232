@@ -6,7 +6,6 @@ import (
 	"errors"
 	"log"
 	"net/http"
-	"strings"
 	"time"
 
 	"batchseal/internal/store"
@@ -18,6 +17,9 @@ const (
 	MaxPayloadBytes   = 65536
 	// Generous envelope ceiling: payload plus JSON framing.
 	MaxChunkBodyBytes = MaxPayloadBytes + 4096
+	// A seal group is an indivisible unit of 2..100 batches.
+	MinGroupBatches = 2
+	MaxGroupBatches = 100
 )
 
 // Server wires the store to HTTP routes.
@@ -43,6 +45,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/batches/{id}", s.handleGetBatch)
 	s.mux.HandleFunc("POST /api/v1/batches/{id}/chunks", s.handleSubmitChunk)
 	s.mux.HandleFunc("POST /api/v1/batches/{id}/seal", s.handleSeal)
+	s.mux.HandleFunc("POST /api/v1/batches/seal-group", s.handleSealGroup)
 }
 
 // Handler returns the root handler with request logging.
@@ -205,18 +208,108 @@ func (s *Server) handleSeal(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// sealGroupRequest is the entire accepted body of a group seal: the group
+// is indivisible, so nothing but the batchIds array is meaningful.
+type sealGroupRequest struct {
+	BatchIDs []string `json:"batchIds"`
+}
+
+func (s *Server) handleSealGroup(w http.ResponseWriter, r *http.Request) {
+	// Validate everything before touching the database: an illegal request
+	// is rejected outright and must never change a member.
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	dec := json.NewDecoder(r.Body)
+	// The body contains batchIds and nothing else.
+	dec.DisallowUnknownFields()
+	var req sealGroupRequest
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_BATCH_GROUP",
+			"request body must be JSON with a batchIds array of 2 to 100 identifiers")
+		return
+	}
+	// Reject trailing data after the JSON object.
+	if dec.More() {
+		writeError(w, http.StatusBadRequest, "INVALID_BATCH_GROUP",
+			"request body must contain exactly one JSON object")
+		return
+	}
+	if len(req.BatchIDs) < MinGroupBatches || len(req.BatchIDs) > MaxGroupBatches {
+		writeError(w, http.StatusBadRequest, "INVALID_BATCH_GROUP",
+			"batchIds must contain between 2 and 100 identifiers")
+		return
+	}
+	seen := make(map[string]struct{}, len(req.BatchIDs))
+	for _, id := range req.BatchIDs {
+		if len(id) != 32 || !isLowerHex(id) {
+			writeError(w, http.StatusBadRequest, "INVALID_BATCH_GROUP",
+				"every batchId must be 32 lowercase hexadecimal characters")
+			return
+		}
+		if _, dup := seen[id]; dup {
+			writeError(w, http.StatusBadRequest, "INVALID_BATCH_GROUP",
+				"batchIds must not contain duplicates")
+			return
+		}
+		seen[id] = struct{}{}
+	}
+
+	snaps, incomplete, err := s.store.SealGroup(r.Context(), req.BatchIDs)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, http.StatusNotFound, "BATCH_NOT_FOUND", "batch does not exist")
+	case errors.Is(err, store.ErrIncomplete):
+		// Only the incomplete members are listed; every member keeps the
+		// state it had before the call (the transaction wrote nothing).
+		batches := make([]any, 0, len(incomplete))
+		for _, snap := range incomplete {
+			batches = append(batches, groupSnapshotJSON(snap))
+		}
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":   "INCOMPLETE",
+			"message": "one or more batches are missing chunks",
+			"batches": batches,
+		})
+	case err != nil:
+		s.log.Printf("seal group: %v", err)
+		writeError(w, http.StatusInternalServerError, "INTERNAL", "internal error")
+	default:
+		batches := make([]any, 0, len(snaps))
+		for _, snap := range snaps {
+			batches = append(batches, snapshotJSON(snap))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"batches": batches})
+	}
+}
+
+// groupSnapshotJSON is the per-batch view in a group seal response: identity,
+// current status and the completeness fields. Used for the incomplete members
+// of a 409 INCOMPLETE.
+func groupSnapshotJSON(s *store.Snapshot) map[string]any {
+	gaps := s.Gaps
+	if gaps == nil {
+		gaps = []int{}
+	}
+	return map[string]any{
+		"batchId":  s.ID,
+		"status":   s.Status,
+		"expected": s.ExpectedChunks,
+		"received": s.Received,
+		"gaps":     gaps,
+	}
+}
+
 // --- helpers ---
 
 func batchIDFromPath(w http.ResponseWriter, r *http.Request) (string, bool) {
 	id := r.PathValue("id")
-	if len(id) != 32 || strings.ToLower(id) != id || !isHex(id) {
+	if len(id) != 32 || !isLowerHex(id) {
 		writeError(w, http.StatusNotFound, "BATCH_NOT_FOUND", "batch does not exist")
 		return "", false
 	}
 	return id, true
 }
 
-func isHex(s string) bool {
+func isLowerHex(s string) bool {
 	for _, c := range []byte(s) {
 		switch {
 		case c >= '0' && c <= '9':
