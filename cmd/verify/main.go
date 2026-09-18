@@ -18,14 +18,21 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	stateFile = "/verify-state/state.json"
+	defaultStateFile = "/verify-state/state.json"
 )
+
+// stateFile is where restart fixtures are persisted; overridable for local
+// runs outside the compose volume.
+func stateFile() string {
+	return envOr("VERIFY_STATE_FILE", defaultStateFile)
+}
 
 type config struct {
 	api1 string
@@ -52,6 +59,7 @@ func main() {
 	v.checkLifecycleAcrossInstances(ctx)
 	v.checkValidation(ctx)
 	v.checkCrossInstanceSealRace(ctx)
+	v.checkSealGroup(ctx)
 
 	switch phase := os.Getenv("VERIFY_PHASE"); phase {
 	case "seed":
@@ -340,6 +348,113 @@ func (v *verifier) checkCrossInstanceSealRace(ctx context.Context) {
 	}
 }
 
+// checkSealGroup exercises the indivisible group seal across both instances:
+// atomic failure with per-member gap reports, the 400/404 matrix, then the
+// atomic success with request-order response and a stable-sealedAt retry.
+func (v *verifier) checkSealGroup(ctx context.Context) {
+	a := v.createBatch(ctx, v.cfg.api1, 2)
+	b := v.createBatch(ctx, v.cfg.api2, 3)
+	if a == "" || b == "" {
+		return
+	}
+
+	submit := func(base, id string, seq int, payload string) {
+		code, body, _ := v.request(ctx, http.MethodPost, base+"/api/v1/batches/"+id+"/chunks",
+			map[string]any{"seq": seq, "payload": payload})
+		if code != 201 {
+			v.failf("group fixture chunk %s/%d: status=%d body=%v", id, seq, code, body)
+		}
+	}
+	submit(v.cfg.api1, a, 1, "a1")
+	submit(v.cfg.api2, a, 2, "a2")
+	submit(v.cfg.api2, b, 1, "b1")
+	submit(v.cfg.api1, b, 3, "b3")
+	// b is missing seq 2.
+
+	sealGroup := func(base string, ids []string) (int, map[string]any) {
+		code, body, _ := v.request(ctx, http.MethodPost, base+"/api/v1/batches/seal-group",
+			map[string]any{"batchIds": ids})
+		return code, body
+	}
+	mustOpen := func(id string) {
+		code, snap, _ := v.request(ctx, http.MethodGet, v.cfg.api1+"/api/v1/batches/"+id, nil)
+		if code != 200 || snap["status"] != "OPEN" || snap["sealedAt"] != nil {
+			v.failf("member %s changed despite failed group seal: code=%d body=%v", id, code, snap)
+		}
+	}
+
+	// Incomplete group: 409 INCOMPLETE listing only B with its gaps; the
+	// whole group keeps its pre-call state (A is NOT sealed).
+	code, body := sealGroup(v.cfg.api1, []string{a, b})
+	if code != 409 || body["error"] != "INCOMPLETE" {
+		v.failf("incomplete group seal: status=%d body=%v", code, body)
+	} else if members, _ := body["batches"].([]any); len(members) != 1 {
+		v.failf("incomplete group should list only B: %v", body)
+	} else {
+		m, _ := members[0].(map[string]any)
+		gaps, _ := m["gaps"].([]any)
+		if m["batchId"] != b || int(m["expected"].(float64)) != 3 ||
+			int(m["received"].(float64)) != 2 || len(gaps) != 1 ||
+			int(gaps[0].(float64)) != 2 {
+			v.failf("incomplete member report wrong: %v", m)
+		}
+	}
+	mustOpen(a)
+	mustOpen(b)
+
+	// 400/404 matrix; every rejection is side-effect free.
+	ghost := "ffffffffffffffffffffffffffffffff"
+	reject := func(name string, ids []string, wantStatus int, wantErr string) {
+		code, body := sealGroup(v.cfg.api2, ids)
+		if code != wantStatus || body["error"] != wantErr {
+			v.failf("%s: status=%d body=%v want %d %s", name, code, body, wantStatus, wantErr)
+		}
+	}
+	reject("single id", []string{a}, 400, "INVALID_BATCH_GROUP")
+	reject("duplicate ids", []string{a, b, a}, 400, "INVALID_BATCH_GROUP")
+	reject("bad id format", []string{a, "zz"}, 400, "INVALID_BATCH_GROUP")
+	reject("unknown id", []string{a, ghost}, 404, "BATCH_NOT_FOUND")
+	mustOpen(a)
+	mustOpen(b)
+
+	// Complete B and seal the group through the other instance: 200 with
+	// snapshots in request order.
+	submit(v.cfg.api2, b, 2, "b2")
+	code, body = sealGroup(v.cfg.api2, []string{a, b})
+	if code != 200 {
+		v.failf("group seal: status=%d body=%v", code, body)
+		return
+	}
+	members, _ := body["batches"].([]any)
+	if len(members) != 2 {
+		v.failf("group seal members: %v", body)
+		return
+	}
+	m0, _ := members[0].(map[string]any)
+	m1, _ := members[1].(map[string]any)
+	if m0["batchId"] != a || m1["batchId"] != b ||
+		m0["status"] != "SEALED" || m1["status"] != "SEALED" ||
+		m0["sealedAt"] == nil || m1["sealedAt"] == nil {
+		v.failf("group seal response wrong: %v", body)
+		return
+	}
+
+	// Retry reversed through instance 1: idempotent, sealedAt stable.
+	code, retry := sealGroup(v.cfg.api1, []string{b, a})
+	rmembers, _ := retry["batches"].([]any)
+	if code != 200 || len(rmembers) != 2 {
+		v.failf("group retry: status=%d body=%v", code, retry)
+		return
+	}
+	r0, _ := rmembers[0].(map[string]any)
+	r1, _ := rmembers[1].(map[string]any)
+	if r0["batchId"] != b || r1["batchId"] != a ||
+		r0["sealedAt"] != m1["sealedAt"] || r1["sealedAt"] != m0["sealedAt"] {
+		v.failf("group retry changed result: %v", retry)
+	}
+	v.log("seal-group acceptance passed on both instances")
+}
+
 // persistedState is handed across the API restart via a shared volume.
 type persistedState struct {
 	OpenID       string `json:"openId"`
@@ -422,19 +537,19 @@ func (v *verifier) phaseRestart(ctx context.Context) {
 }
 
 func writeState(s persistedState) error {
-	if err := os.MkdirAll("/verify-state", 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(stateFile()), 0o755); err != nil {
 		return err
 	}
 	b, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(stateFile, b, 0o644)
+	return os.WriteFile(stateFile(), b, 0o644)
 }
 
 func readState() (persistedState, error) {
 	var s persistedState
-	b, err := os.ReadFile(stateFile)
+	b, err := os.ReadFile(stateFile())
 	if err != nil {
 		return s, err
 	}

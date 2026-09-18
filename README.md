@@ -143,6 +143,51 @@ docker compose down -v
 }
 ```
 
+### 5. 组封存（不可分割单元）
+
+`POST /api/v1/batches/seal-group`
+
+测序交接把若干批次当作**一个不可分割单元**封存：要么全组进入 `SEALED`，
+要么一个都不动。请求体仅含 `batchIds` 数组，**2–100** 个 ID，沿用 32 位小写
+十六进制格式且**不可重复**：
+
+```json
+{ "batchIds": ["182a8a5485765bafb286a7a8e4ce7c69", "9f0c..."] }
+```
+
+- 所有 OPEN 成员齐备：**同一事务**共同转为 `SEALED`，返回 `200`，`batches`
+  按**请求顺序**给出各成员快照（含 `sealedAt`）；已 `SEALED` 成员视为幂等成功，
+  **保留原 `sealedAt`**
+- 任一 OPEN 成员缺片：**409 `INCOMPLETE`**，`batches` 按请求顺序列出**所有不完整
+  成员**的 `expected`、`received` 与升序 `gaps`；**全组保持调用前状态**
+- 数量/格式/重复非法：**400 `INVALID_BATCH_GROUP`**；任一 ID 未知：
+  **404 `BATCH_NOT_FOUND`**；失败均不改变任何成员
+
+`200` 示例：
+
+```json
+{
+  "batches": [
+    { "batchId": "...", "status": "SEALED", "expected": 2, "received": 2, "gaps": [],
+      "sealedAt": "2026-09-18T20:01:02.123456Z" },
+    { "batchId": "...", "status": "SEALED", "expected": 3, "received": 3, "gaps": [],
+      "sealedAt": "2026-09-18T20:01:02.123456Z" }
+  ]
+}
+```
+
+`409 INCOMPLETE` 示例（仅列不完整成员，全组未变）：
+
+```json
+{
+  "error": "INCOMPLETE",
+  "message": "one or more batches are missing chunks; the group was not sealed",
+  "batches": [
+    { "batchId": "...", "expected": 3, "received": 2, "gaps": [2] }
+  ]
+}
+```
+
 ---
 
 ## 固定状态码表
@@ -160,6 +205,10 @@ docker compose down -v
 | 同序号不同内容 | 409 | `CHUNK_CONFLICT` |
 | 封存后变更内容 | 409 | `BATCH_SEALED` |
 | 缺片封存 | 409 | `INCOMPLETE`（携带 `gaps`，保持 OPEN） |
+| 组封存请求非法（数量/格式/重复） | 400 | `INVALID_BATCH_GROUP` |
+| 组内含未知批次 | 404 | `BATCH_NOT_FOUND`（全组不变） |
+| 组内任一 OPEN 成员缺片 | 409 | `INCOMPLETE`（携带不完整成员，全组不变） |
+| 组封存成功 / 幂等重试 | 200 | —（`batches` 按请求顺序，`sealedAt` 稳定） |
 | 分片首次写入 | 201 | — |
 | 相同内容重传 / 封存后相同重传 | 200 | — |
 | 齐备封存成功 / 重复封存 | 200 | — |
@@ -203,6 +252,13 @@ curl -s -X POST localhost:8080/api/v1/batches/$B/seal                           
 任何快照下都不可能出现 `status=SEALED` 而 `gaps` 非空。同序号两个不同内容并发时，
 一个事务先插入并提交，另一个读到已存字节并返回 `CHUNK_CONFLICT`，分片表始终只有一行。
 
+组封存把同样的裁决扩展到多批次：单个 PostgreSQL 事务先按 **ID 升序**对全组成
+员行取 `FOR UPDATE`（与单批次封存、分片提交共享同一套行锁），再从**锁后快照**计
+算各成员缺口。只有所有 OPEN 成员齐备才在同一事务里共同 `UPDATE` 为 `SEALED`；
+任一成员缺片则整体回滚。因此 `[A,B]` 与 `[B,A]` 的反序组请求、单批次封存与最后
+一片分片三方并发时只会串行等待、不会死锁，也不可能出现"部分成员被封存"的中
+间态；已 `SEALED` 成员的 `sealedAt` 永不被覆盖。
+
 状态接口在一条 SQL 快照中同时计算 `received` 与 `gaps`，二者永远自洽。
 
 ## 重启一致性
@@ -233,10 +289,16 @@ go test -race -count=1 ./...
 关键测试：
 
 - `internal/store`：乱序、重传幂等、UTF-8 字节判同、冲突、封存不完整保持 OPEN、
-  封存/最后一片跨连接池竞争（30 轮）、双写冲突竞争（30 轮）、关闭全部连接后重开的重启一致性；
+  封存/最后一片跨连接池竞争（30 轮）、双写冲突竞争（30 轮）、组封存成功与重试
+  `sealedAt` 稳定、组内缺片整体不变、未知 ID 无副作用、既有 `sealedAt` 保留、
+  `[A,B]`/`[B,A]`/最后一片三方竞争（25 轮，超时防死锁）、组封存与单批次封存竞争
+  （25 轮）、关闭全部连接后重开的重启一致性；
 - `internal/api`：两个独立连接池支撑的两个 HTTP 实例上交替写入/封存、全状态码矩阵、
-  跨实例封存竞争（20 轮）、关闭并重建两个实例后的终态一致性；
-- `cmd/verify`：Compose 内一次性验收程序，协议矩阵 + 25 轮跨实例竞争 + 重启两阶段。
+  跨实例封存竞争（20 轮）、组封存跨实例生命周期与幂等重试、组内缺片 409 且全组不变、
+  组请求 400/404 校验矩阵无副作用、双实例三方交错竞争（20 轮，超时防死锁）、
+  关闭并重建两个实例后的终态一致性；
+- `cmd/verify`：Compose 内一次性验收程序，协议矩阵 + 组封存验收 + 25 轮跨实例竞争 +
+  重启两阶段。
 
 环境变量：
 

@@ -19,3 +19,11 @@ coverage.html
 
 # Go
 vendor/
+
+# Local toolchain / test database (not part of the project)
+.toolchain/
+.gopath/
+.gocache/
+.pg/
+.pgdata/
+.pgdata.log

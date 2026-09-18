@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -97,6 +98,34 @@ func (c *client) postRaw(t *testing.T, url, raw string) (int, map[string]any) {
 
 func (c *client) get(t *testing.T, url string) (int, map[string]any) {
 	return c.do(t, http.MethodGet, url, "", nil)
+}
+
+// postQuiet is the non-fatal variant for use inside race goroutines.
+func (c *client) postQuiet(url string, body any) (int, map[string]any) {
+	var rdr io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return 0, nil
+		}
+		rdr = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(http.MethodPost, url, rdr)
+	if err != nil {
+		return 0, nil
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, nil
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	parsed := map[string]any{}
+	_ = json.Unmarshal(data, &parsed)
+	return resp.StatusCode, parsed
 }
 
 func TestHTTPLifecycleAcrossTwoInstances(t *testing.T) {
@@ -384,6 +413,291 @@ func TestHTTPRestartBothInstances(t *testing.T) {
 		code, reseal := c.post(t, srv2.URL+"/api/v1/batches/"+batchSealed+"/seal", nil)
 		if code != 200 || reseal["sealedAt"] != sealTime {
 			t.Fatalf("reseal after restart: code=%d body=%v", code, reseal)
+		}
+	}
+}
+
+// TestHTTPSealGroupAcrossInstances seals a two-batch group through one
+// instance and verifies the verdict, the request-order response and the
+// idempotent retry (stable sealedAt) through the other.
+func TestHTTPSealGroupAcrossInstances(t *testing.T) {
+	u1, u2, cleanup := newAPIs(t)
+	defer cleanup()
+	c := newClient()
+
+	_, body := c.post(t, u1+"/api/v1/batches", map[string]int{"expectedChunks": 2})
+	a := body["batchId"].(string)
+	_, body = c.post(t, u2+"/api/v1/batches", map[string]int{"expectedChunks": 2})
+	b := body["batchId"].(string)
+
+	// Chunks alternate instances and arrive out of order.
+	for _, step := range []struct {
+		base, id, payload string
+		seq               int
+	}{
+		{u2, a, "a2", 2},
+		{u1, a, "a1", 1},
+		{u1, b, "b2", 2},
+		{u2, b, "b1", 1},
+	} {
+		code, resp := c.post(t, step.base+"/api/v1/batches/"+step.id+"/chunks",
+			map[string]any{"seq": step.seq, "payload": step.payload})
+		if code != 201 {
+			t.Fatalf("chunk %s/%d: code=%d body=%v", step.id, step.seq, code, resp)
+		}
+	}
+
+	code, group := c.post(t, u1+"/api/v1/batches/seal-group",
+		map[string]any{"batchIds": []string{a, b}})
+	if code != 200 {
+		t.Fatalf("seal group: code=%d body=%v", code, group)
+	}
+	members, _ := group["batches"].([]any)
+	if len(members) != 2 {
+		t.Fatalf("seal group members: %v", group)
+	}
+	m0, _ := members[0].(map[string]any)
+	m1, _ := members[1].(map[string]any)
+	if m0["batchId"] != a || m1["batchId"] != b {
+		t.Fatalf("response not in request order: %v", group)
+	}
+	for _, m := range []map[string]any{m0, m1} {
+		if m["status"] != "SEALED" || m["sealedAt"] == nil ||
+			int(m["received"].(float64)) != 2 || len(m["gaps"].([]any)) != 0 {
+			t.Fatalf("member not cleanly sealed: %v", m)
+		}
+	}
+	sealedAtA, _ := m0["sealedAt"].(string)
+	sealedAtB, _ := m1["sealedAt"].(string)
+
+	// Verdict visible on the other instance.
+	code, snap := c.get(t, u2+"/api/v1/batches/"+a)
+	if code != 200 || snap["status"] != "SEALED" || snap["sealedAt"] != sealedAtA {
+		t.Fatalf("cross-instance group verdict: code=%d body=%v", code, snap)
+	}
+
+	// Retry in reversed order via the other instance: idempotent success,
+	// sealedAt timestamps unchanged.
+	code, retry := c.post(t, u2+"/api/v1/batches/seal-group",
+		map[string]any{"batchIds": []string{b, a}})
+	if code != 200 {
+		t.Fatalf("retry: code=%d body=%v", code, retry)
+	}
+	rmembers, _ := retry["batches"].([]any)
+	r0, _ := rmembers[0].(map[string]any)
+	r1, _ := rmembers[1].(map[string]any)
+	if r0["batchId"] != b || r1["batchId"] != a ||
+		r0["sealedAt"] != sealedAtB || r1["sealedAt"] != sealedAtA {
+		t.Fatalf("retry changed result: %v", retry)
+	}
+}
+
+// TestHTTPSealGroupIncompleteLeavesGroupUnchanged: A is complete, B is short
+// one chunk. The group seal must fail with 409 INCOMPLETE listing only B, and
+// both members keep their pre-call state (A is NOT sealed).
+func TestHTTPSealGroupIncompleteLeavesGroupUnchanged(t *testing.T) {
+	u1, u2, cleanup := newAPIs(t)
+	defer cleanup()
+	c := newClient()
+
+	_, body := c.post(t, u1+"/api/v1/batches", map[string]int{"expectedChunks": 2})
+	a := body["batchId"].(string)
+	_, body = c.post(t, u2+"/api/v1/batches", map[string]int{"expectedChunks": 3})
+	b := body["batchId"].(string)
+
+	for _, seq := range []int{1, 2} {
+		c.post(t, u1+"/api/v1/batches/"+a+"/chunks",
+			map[string]any{"seq": seq, "payload": "x"})
+	}
+	for _, seq := range []int{1, 3} { // B misses seq 2
+		c.post(t, u2+"/api/v1/batches/"+b+"/chunks",
+			map[string]any{"seq": seq, "payload": "y"})
+	}
+
+	code, group := c.post(t, u1+"/api/v1/batches/seal-group",
+		map[string]any{"batchIds": []string{a, b}})
+	if code != 409 || group["error"] != "INCOMPLETE" {
+		t.Fatalf("incomplete group: code=%d body=%v", code, group)
+	}
+	members, _ := group["batches"].([]any)
+	if len(members) != 1 {
+		t.Fatalf("incomplete list should hold only B: %v", group)
+	}
+	m, _ := members[0].(map[string]any)
+	gaps, _ := m["gaps"].([]any)
+	if m["batchId"] != b || int(m["expected"].(float64)) != 3 ||
+		int(m["received"].(float64)) != 2 || len(gaps) != 1 ||
+		int(gaps[0].(float64)) != 2 {
+		t.Fatalf("incomplete member report wrong: %v", m)
+	}
+
+	// Both members unchanged: still OPEN, no sealedAt.
+	for _, id := range []string{a, b} {
+		code, snap := c.get(t, u2+"/api/v1/batches/"+id)
+		if code != 200 || snap["status"] != "OPEN" || snap["sealedAt"] != nil {
+			t.Fatalf("member %s changed despite failed group seal: %v", id, snap)
+		}
+	}
+
+	// Completing B lets the retry seal the whole group.
+	c.post(t, u1+"/api/v1/batches/"+b+"/chunks", map[string]any{"seq": 2, "payload": "y"})
+	code, group = c.post(t, u2+"/api/v1/batches/seal-group",
+		map[string]any{"batchIds": []string{a, b}})
+	if code != 200 {
+		t.Fatalf("retry after completing B: code=%d body=%v", code, group)
+	}
+}
+
+// TestHTTPSealGroupValidation covers the fixed 400/404 matrix for the group
+// endpoint and proves failed requests leave every member untouched.
+func TestHTTPSealGroupValidation(t *testing.T) {
+	u1, u2, cleanup := newAPIs(t)
+	defer cleanup()
+	c := newClient()
+
+	_, body := c.post(t, u1+"/api/v1/batches", map[string]int{"expectedChunks": 1})
+	a := body["batchId"].(string)
+	_, body = c.post(t, u2+"/api/v1/batches", map[string]int{"expectedChunks": 1})
+	b := body["batchId"].(string)
+	ghost := "ffffffffffffffffffffffffffffffff"
+
+	tooMany := make([]string, 0, 101)
+	for i := 0; i < 101; i++ {
+		tooMany = append(tooMany, fmt.Sprintf("%032x", i+1))
+	}
+
+	cases := []struct {
+		name       string
+		url        string
+		body       any
+		raw        string
+		wantStatus int
+		wantError  string
+	}{
+		{"empty array", u1 + "/api/v1/batches/seal-group",
+			map[string]any{"batchIds": []string{}}, "", 400, "INVALID_BATCH_GROUP"},
+		{"single id", u1 + "/api/v1/batches/seal-group",
+			map[string]any{"batchIds": []string{a}}, "", 400, "INVALID_BATCH_GROUP"},
+		{"101 ids", u2 + "/api/v1/batches/seal-group",
+			map[string]any{"batchIds": tooMany}, "", 400, "INVALID_BATCH_GROUP"},
+		{"duplicate ids", u1 + "/api/v1/batches/seal-group",
+			map[string]any{"batchIds": []string{a, b, a}}, "", 400, "INVALID_BATCH_GROUP"},
+		{"bad id format", u1 + "/api/v1/batches/seal-group",
+			map[string]any{"batchIds": []string{a, "not-a-batch-id"}}, "", 400, "INVALID_BATCH_GROUP"},
+		{"uppercase id", u2 + "/api/v1/batches/seal-group",
+			map[string]any{"batchIds": []string{a, strings.ToUpper(b)}}, "", 400, "INVALID_BATCH_GROUP"},
+		{"non-string element", u1 + "/api/v1/batches/seal-group",
+			nil, `{"batchIds":["` + a + `",7]}`, 400, "INVALID_BATCH_GROUP"},
+		{"batchIds not array", u1 + "/api/v1/batches/seal-group",
+			nil, `{"batchIds":"` + a + `"}`, 400, "INVALID_BATCH_GROUP"},
+		{"missing batchIds", u2 + "/api/v1/batches/seal-group",
+			map[string]any{"ids": []string{a, b}}, "", 400, "INVALID_BATCH_GROUP"},
+		{"malformed json", u1 + "/api/v1/batches/seal-group",
+			nil, `{"batchIds":[`, 400, "INVALID_BATCH_GROUP"},
+		{"unknown id", u1 + "/api/v1/batches/seal-group",
+			map[string]any{"batchIds": []string{a, ghost}}, "", 404, "BATCH_NOT_FOUND"},
+		{"unknown id reversed", u2 + "/api/v1/batches/seal-group",
+			map[string]any{"batchIds": []string{ghost, b}}, "", 404, "BATCH_NOT_FOUND"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var code int
+			var resp map[string]any
+			if tc.raw != "" {
+				code, resp = c.postRaw(t, tc.url, tc.raw)
+			} else {
+				code, resp = c.post(t, tc.url, tc.body)
+			}
+			if code != tc.wantStatus || resp["error"] != tc.wantError {
+				t.Fatalf("got code=%d body=%v, want %d %s", code, resp, tc.wantStatus, tc.wantError)
+			}
+		})
+	}
+
+	// No failed request touched the members.
+	for _, id := range []string{a, b} {
+		code, snap := c.get(t, u1+"/api/v1/batches/"+id)
+		if code != 200 || snap["status"] != "OPEN" || snap["sealedAt"] != nil {
+			t.Fatalf("member %s changed by rejected group requests: %v", id, snap)
+		}
+	}
+}
+
+// TestHTTPSealGroupThreeWayRace fires the [A,B] group on one instance, the
+// reversed [B,A] group on the other and B's final chunk concurrently. With a
+// hard timeout as deadlock tripwire, the only legal outcomes are the whole
+// group SEALED (one transaction, identical sealedAt) or no new seal at all.
+func TestHTTPSealGroupThreeWayRace(t *testing.T) {
+	u1, u2, cleanup := newAPIs(t)
+	defer cleanup()
+	c := newClient()
+
+	const rounds = 20
+	for i := 0; i < rounds; i++ {
+		_, body := c.post(t, u1+"/api/v1/batches", map[string]int{"expectedChunks": 1})
+		a := body["batchId"].(string)
+		_, body = c.post(t, u2+"/api/v1/batches", map[string]int{"expectedChunks": 1})
+		b := body["batchId"].(string)
+		c.post(t, u1+"/api/v1/batches/"+a+"/chunks", map[string]any{"seq": 1, "payload": "a"})
+
+		type result struct {
+			code int
+			body map[string]any
+		}
+		resCh := make(chan result, 3)
+		go func() {
+			code, resp := c.postQuiet(u1+"/api/v1/batches/seal-group",
+				map[string]any{"batchIds": []string{a, b}})
+			resCh <- result{code, resp}
+		}()
+		go func() {
+			code, resp := c.postQuiet(u2+"/api/v1/batches/seal-group",
+				map[string]any{"batchIds": []string{b, a}})
+			resCh <- result{code, resp}
+		}()
+		go func() {
+			code, resp := c.postQuiet(u1+"/api/v1/batches/"+b+"/chunks",
+				map[string]any{"seq": 1, "payload": "final"})
+			resCh <- result{code, resp}
+		}()
+
+		var results []result
+		timeout := time.After(30 * time.Second)
+		for len(results) < 3 {
+			select {
+			case r := <-resCh:
+				results = append(results, r)
+			case <-timeout:
+				t.Fatalf("round %d: three-way race deadlocked", i)
+			}
+		}
+		for _, r := range results {
+			if r.code == 0 {
+				t.Fatalf("round %d: transport error in race", i)
+			}
+		}
+
+		code, snapA := c.get(t, u1+"/api/v1/batches/"+a)
+		if code != 200 {
+			t.Fatalf("round %d: status A: %d", i, code)
+		}
+		code, snapB := c.get(t, u2+"/api/v1/batches/"+b)
+		if code != 200 {
+			t.Fatalf("round %d: status B: %d", i, code)
+		}
+		sealedA := snapA["status"] == "SEALED"
+		sealedB := snapB["status"] == "SEALED"
+		if sealedA != sealedB {
+			t.Fatalf("round %d: group partially sealed: A=%v B=%v", i, snapA["status"], snapB["status"])
+		}
+		if sealedA {
+			if int(snapA["received"].(float64)) != 1 || int(snapB["received"].(float64)) != 1 {
+				t.Fatalf("round %d: SEALED with gaps: A=%v B=%v", i, snapA, snapB)
+			}
+			if snapA["sealedAt"] != snapB["sealedAt"] {
+				t.Fatalf("round %d: members sealed by different transactions: %v vs %v",
+					i, snapA["sealedAt"], snapB["sealedAt"])
+			}
 		}
 	}
 }

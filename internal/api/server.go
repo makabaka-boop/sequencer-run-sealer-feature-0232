@@ -18,6 +18,9 @@ const (
 	MaxPayloadBytes   = 65536
 	// Generous envelope ceiling: payload plus JSON framing.
 	MaxChunkBodyBytes = MaxPayloadBytes + 4096
+	// A seal group binds 2..100 batches into one indivisible unit.
+	MinSealGroupSize = 2
+	MaxSealGroupSize = 100
 )
 
 // Server wires the store to HTTP routes.
@@ -43,6 +46,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/batches/{id}", s.handleGetBatch)
 	s.mux.HandleFunc("POST /api/v1/batches/{id}/chunks", s.handleSubmitChunk)
 	s.mux.HandleFunc("POST /api/v1/batches/{id}/seal", s.handleSeal)
+	s.mux.HandleFunc("POST /api/v1/batches/seal-group", s.handleSealGroup)
 }
 
 // Handler returns the root handler with request logging.
@@ -202,6 +206,89 @@ func (s *Server) handleSeal(w http.ResponseWriter, r *http.Request) {
 	default:
 		// Repeated seal of an already SEALED batch is idempotent.
 		writeJSON(w, http.StatusOK, snapshotJSON(snap))
+	}
+}
+
+// handleSealGroup seals a whole batch group as one indivisible unit. The
+// request body carries only a batchIds array (2–100 ids, existing id format,
+// no repeats). All members transition to SEALED together or not at all.
+func (s *Server) handleSealGroup(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE", "request body too large")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "INVALID_BATCH_GROUP",
+			"request body must be a JSON object with a batchIds array")
+		return
+	}
+	idsRaw, ok := raw["batchIds"]
+	if !ok {
+		writeError(w, http.StatusBadRequest, "INVALID_BATCH_GROUP", "batchIds is required")
+		return
+	}
+	var ids []string
+	if err := json.Unmarshal(idsRaw, &ids); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_BATCH_GROUP",
+			"batchIds must be an array of batch id strings")
+		return
+	}
+	if len(ids) < MinSealGroupSize || len(ids) > MaxSealGroupSize {
+		writeError(w, http.StatusBadRequest, "INVALID_BATCH_GROUP",
+			"batchIds must contain between 2 and 100 ids")
+		return
+	}
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if len(id) != 32 || strings.ToLower(id) != id || !isHex(id) {
+			writeError(w, http.StatusBadRequest, "INVALID_BATCH_GROUP",
+				"every batch id must be a 32-character lowercase hex string")
+			return
+		}
+		if _, dup := seen[id]; dup {
+			writeError(w, http.StatusBadRequest, "INVALID_BATCH_GROUP",
+				"batch ids must not repeat")
+			return
+		}
+		seen[id] = struct{}{}
+	}
+
+	snaps, err := s.store.SealGroup(r.Context(), ids)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, http.StatusNotFound, "BATCH_NOT_FOUND", "batch does not exist")
+	case errors.Is(err, store.ErrIncomplete):
+		// List every incomplete member in request order; the whole group
+		// keeps its pre-call state.
+		incomplete := make([]map[string]any, 0, len(snaps))
+		for _, snap := range snaps {
+			if snap.Status == store.StatusSealed || len(snap.Gaps) == 0 {
+				continue
+			}
+			incomplete = append(incomplete, map[string]any{
+				"batchId":  snap.ID,
+				"expected": snap.ExpectedChunks,
+				"received": snap.Received,
+				"gaps":     snap.Gaps,
+			})
+		}
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":   "INCOMPLETE",
+			"message": "one or more batches are missing chunks; the group was not sealed",
+			"batches": incomplete,
+		})
+	case err != nil:
+		s.log.Printf("seal group: %v", err)
+		writeError(w, http.StatusInternalServerError, "INTERNAL", "internal error")
+	default:
+		batches := make([]map[string]any, 0, len(snaps))
+		for _, snap := range snaps {
+			batches = append(batches, snapshotJSON(snap))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"batches": batches})
 	}
 }
 
